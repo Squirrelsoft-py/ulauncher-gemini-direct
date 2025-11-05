@@ -6,12 +6,12 @@ import requests
 import traceback
 from ulauncher.api.client.Extension import Extension
 from ulauncher.api.client.EventListener import EventListener
-from ulauncher.api.shared.event import KeywordQueryEvent, ItemEnterEvent, PreferencesEvent
+from ulauncher.api.shared.event import KeywordQueryEvent, PreferencesEvent
 from ulauncher.api.shared.item.ExtensionResultItem import ExtensionResultItem
 from ulauncher.api.shared.action.RenderResultListAction import RenderResultListAction
 from ulauncher.api.shared.action.OpenUrlAction import OpenUrlAction
 from ulauncher.api.shared.action.CopyToClipboardAction import CopyToClipboardAction
-from ulauncher.api.shared.action.ExtensionCustomAction import ExtensionCustomAction
+from ulauncher.api.shared.action.DoNothingAction import DoNothingAction
 
 # Hardcoded system prompt that will be included in every request
 SYSTEM_PROMPT = """You are responding through an ephemeral interface with no follow-up capability so you need to provide a single comprehensive response that does not ask for further clarifications/information.
@@ -161,265 +161,14 @@ def shorten_path_for_display(full_path):
         return full_path
 
 
-def load_preferences(extension):
-    """Loads and validates preferences."""
-    prefs = extension.preferences
-    config = {
-        'model': 'gemini-2.5-flash',
-        'custom_model': '',
-        'api_key': '',
-        'wrap_width': 43,
-        'wide_script_factor': 0.96,
-        'log_enabled': False,
-        'show_log_line': True,
-        'debug_mode': False,
-        'log_path': '',
-        'prompt_context': '',
-        'temperature': 0.44
-    }
-
-    config['model'] = prefs.get('model', config['model'])
-    config['custom_model'] = prefs.get('custom_model', config['custom_model']).strip()
-    config['api_key'] = prefs.get('api_key', config['api_key'])
-    config['log_enabled'] = prefs.get('log_enabled', 'false') == 'true'
-    config['show_log_line'] = prefs.get('show_log_line', 'true') == 'true'
-    config['debug_mode'] = prefs.get('debug_mode', 'false') == 'true'
-    config['log_path'] = prefs.get('log_path', config['log_path']).strip()
-    config['prompt_context'] = prefs.get('prompt_context', config['prompt_context']).strip()
-
-    # --- Validate and set wrap_width ---
-    try:
-        pref_wrap_width = prefs.get('wrap_width', '').strip()
-        if pref_wrap_width:
-             config['wrap_width'] = int(pref_wrap_width)
-    except ValueError:
-         if config['debug_mode']:
-             print(f"[Debug] Invalid wrap_width value '{prefs.get('wrap_width', '')}', using default {config['wrap_width']}")
-
-    # --- Parse and Validate Temperature ---
-    temp_str = prefs.get('temperature', '').strip()
-    original_temp_value = None
-    try:
-        if temp_str:
-            temp_float = float(temp_str)
-            original_temp_value = temp_float
-            config['temperature'] = max(0.0, min(1.0, temp_float))
-            if original_temp_value != config['temperature']:
-                 print(f"[Info] Gemini Direct: Temperature '{original_temp_value}' is outside the range [0.0, 1.0]. "
-                       f"Using clamped value: {config['temperature']:.2f}")
-    except ValueError:
-        if config['debug_mode']:
-            print(f"[Debug] Invalid temperature value '{temp_str}', using default {config['temperature']:.2f}")
-
-    # --- Parse and Validate Wide Script Factor ---
-    factor_str = prefs.get('wide_script_factor', '').strip()
-    original_factor_value = None
-    try:
-        if factor_str:
-            factor_float = float(factor_str)
-            original_factor_value = factor_float
-            config['wide_script_factor'] = max(0.2, min(1.8, factor_float))
-            if original_factor_value != config['wide_script_factor']:
-                print(f"[Info] Gemini Direct: Wide Script Factor '{original_factor_value}' outside allowed range [0.2, 1.8]. "
-                      f"Using clamped value: {config['wide_script_factor']:.3f}")
-    except ValueError:
-         if config['debug_mode']:
-             print(f"[Debug] Invalid Wide Script Factor '{factor_str}', using default {config['wide_script_factor']:.3f}")
-
-    # --- Determine model to use ---
-    config['model_to_use'] = config['custom_model'] if config['custom_model'] else config['model']
-    if not config['model_to_use'].startswith('models/'):
-        config['model_to_use'] = f"models/{config['model_to_use']}"
-    config['model_name'] = config['model_to_use'].split('/')[-1]
-
-    # --- Adjust log settings ---
-    if not config['log_enabled']:
-        config['show_log_line'] = False
-
-    if config['log_path']:
-        config['log_path'] = os.path.expanduser(config['log_path'])
-    elif config['log_enabled']:
-        config['log_path'] = os.path.expanduser("~/Documents/gemini_direct_qa.log")
-    else:
-         config['log_path'] = None
-
-    return config
-
-
-def build_prompt(query, context):
-    """Builds the full prompt including system message and context."""
-    if context:
-        full_context = f"{SYSTEM_PROMPT}\n\n{context}"
-        return f"{full_context}\n\n{query}"
-    else:
-        return f"{SYSTEM_PROMPT}\n\n{query}"
-
-
-def call_gemini_api(config, query):
-    """Makes the API call to Gemini."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/{config['model_to_use']}:generateContent"
-    headers = {"Content-Type": "application/json"}
-    params = {"key": config['api_key']}
-    prompt = build_prompt(query, config['prompt_context'])
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": config['temperature']}
-    }
-
-    if config['debug_mode']:
-        masked_params = {"key": mask_api_key(config['api_key'])}
-        print("\n--- Gemini API Request ---")
-        print(f"[Debug] URL: {url}")
-        print(f"[Debug] Params: {masked_params}")
-        print(f"[Debug] Temp: {config['temperature']:.2f}")
-        print(f"[Debug] User Query: {query}")
-        print("--------------------------")
-
-    response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
-
-    if config['debug_mode']:
-        print("\n--- Gemini API Response ---")
-        print(f"[Debug] Status Code: {response.status_code}")
-        try:
-            response_data = response.json()
-            response_str = json.dumps(response_data, ensure_ascii=False, indent=2)
-            print(f"[Debug] Response Body (JSON):\n{response_str}")
-        except json.JSONDecodeError:
-            print(f"[Debug] Response Body (Raw Text):\n{response.text}")
-        print("---------------------------")
-
-    return response
-
-
-def process_api_response(response, config, query, extension):
-    """Processes the API response and returns Ulauncher items."""
-    items = []
-    response_json = None
-
-    try:
-        response_json = response.json()
-    except json.JSONDecodeError:
-        error_msg = f"Invalid JSON response from API. Status: {response.status_code}. Body: {response.text[:200]}..."
-        items.append(ExtensionResultItem(
-            icon='images/error.png',
-            name='API Error: Invalid Response',
-            description=error_msg if config['debug_mode'] else "Received non-JSON response from API.",
-            on_enter=CopyToClipboardAction(f"API Error {response.status_code}: {response.text}")
-        ))
-        return items
-
-    # --- Process successful response (Status Code 200) ---
-    if response.status_code == 200:
-        response_text = ""
-        candidates = response_json.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content")
-            if content:
-                parts = content.get("parts")
-                if parts:
-                     response_text = parts[0].get("text", "")
-
-        if response_text:
-            extension.last_response = response_text
-            log_success = False
-            if config['log_enabled'] and config['log_path']:
-                log_success = log_qa(config['log_path'], query, response_text, config['model_name'], config['debug_mode'])
-                if not log_success and config['debug_mode']:
-                     print(f"[Debug] Failed to log Q&A to {config['log_path']}")
-
-            formatted_text = format_for_display(
-                response_text,
-                config['wrap_width'],
-                config['wide_script_factor']
-            )
-            items.append(ExtensionResultItem(
-                icon='images/gemini.png',
-                name=formatted_text,
-                description=f'\nresponse by {config["model_name"]}',
-                on_enter=CopyToClipboardAction(response_text)
-            ))
-
-            if config['log_enabled'] and config['log_path'] and config['show_log_line'] and log_success:
-                display_log_path = shorten_path_for_display(config["log_path"])
-                items.append(ExtensionResultItem(
-                    icon='images/log.png',
-                    name='',
-                    description=f'Q&A saved to {display_log_path}',
-                    on_enter=OpenUrlAction(f'file://{config["log_path"]}')
-                ))
-        else:
-            description = "API returned an empty response."
-            prompt_feedback = response_json.get("promptFeedback")
-            if prompt_feedback:
-                 block_reason = prompt_feedback.get("blockReason")
-                 if block_reason:
-                     description = f"Blocked: {block_reason}."
-                     if config['debug_mode']:
-                          safety_ratings = prompt_feedback.get("safetyRatings", [])
-                          ratings_str = ", ".join([f"{r.get('category')}: {r.get('probability')}" for r in safety_ratings])
-                          if ratings_str:
-                               description += f" Safety: [{ratings_str}]"
-                 elif config['debug_mode']:
-                     description += f" (Debug: Prompt feedback present but no block reason: {json.dumps(prompt_feedback)})"
-
-            items.append(ExtensionResultItem(
-                icon='images/warning.png',
-                name='Empty response from Gemini',
-                description=description,
-                on_enter=CopyToClipboardAction(f"Empty response from Gemini. Reason: {description}. Full JSON: {json.dumps(response_json)}")
-            ))
-
-    elif response.status_code == 429:
-        error_msg = "Rate limit exceeded. Free tier limit often 15 reqs/min. Wait and try again."
-        items.append(ExtensionResultItem(
-            icon='images/warning.png',
-            name='Rate limit exceeded (429)',
-            description=error_msg,
-            on_enter=CopyToClipboardAction(error_msg)
-        ))
-    else:
-        status_code = response.status_code
-        error_msg = "Unknown API error"
-        is_likely_api_key_error = False
-
-        if response_json and "error" in response_json:
-            error_details = response_json["error"]
-            error_msg = error_details.get("message", "No error message provided.")
-
-            api_key_error_keywords = ["api key not valid", "permission denied", "api key invalid"]
-            if status_code == 403 or any(keyword in error_msg.lower() for keyword in api_key_error_keywords):
-                 is_likely_api_key_error = True
-                 error_msg = f"API Key Error: {error_msg}"
-
-            if config['debug_mode'] and not is_likely_api_key_error:
-                error_msg += f" (Status: {error_details.get('status', 'N/A')}, Code: {error_details.get('code', 'N/A')})"
-
-        if is_likely_api_key_error:
-            items.append(ExtensionResultItem(
-                icon='images/warning.png',
-                name='Invalid API Key?',
-                description=error_msg,
-                on_enter=OpenUrlAction('ulauncher://extensions/ul-query-gemini/preferences')
-            ))
-        else:
-            items.append(ExtensionResultItem(
-                icon='images/error.png',
-                name=f'API Error {status_code}',
-                description=error_msg,
-                on_enter=CopyToClipboardAction(f"Error {status_code}: {error_msg}\nResponse: {json.dumps(response_json)}")
-            ))
-
-    return items
-
-
 class GeminiExtension(Extension):
     def __init__(self):
         super().__init__()
         self.subscribe(KeywordQueryEvent, KeywordQueryEventListener())
-        self.subscribe(ItemEnterEvent, ItemEnterEventListener())
         self.subscribe(PreferencesEvent, PreferencesEventListener())
         self.last_response = ""
-
+        self.last_query = ""
+        self.last_response_items = []
 
 class PreferencesEventListener(EventListener):
     def on_event(self, event, extension):
@@ -433,12 +182,263 @@ class PreferencesEventListener(EventListener):
 
 
 class KeywordQueryEventListener(EventListener):
+
+    def _load_preferences(self, extension):
+        """Loads and validates preferences."""
+        prefs = extension.preferences
+        config = {
+            'model': 'gemini-2.5-flash',
+            'custom_model': '',
+            'api_key': '',
+            'wrap_width': 43,
+            'wide_script_factor': 0.96,
+            'log_enabled': False,
+            'show_log_line': True,
+            'debug_mode': False,
+            'log_path': '',
+            'prompt_context': '',
+            'temperature': 0.44,
+            'trigger_char': '!'
+        }
+
+        config['model'] = prefs.get('model', config['model'])
+        config['custom_model'] = prefs.get('custom_model', config['custom_model']).strip()
+        config['api_key'] = prefs.get('api_key', config['api_key'])
+        config['log_enabled'] = prefs.get('log_enabled', 'false') == 'true'
+        config['show_log_line'] = prefs.get('show_log_line', 'true') == 'true'
+        config['debug_mode'] = prefs.get('debug_mode', 'false') == 'true'
+        config['log_path'] = prefs.get('log_path', config['log_path']).strip()
+        config['prompt_context'] = prefs.get('prompt_context', config['prompt_context']).strip()
+        config['trigger_char'] = prefs.get('trigger_char', config['trigger_char']).strip()
+
+        # --- Validate and set wrap_width ---
+        try:
+            pref_wrap_width = prefs.get('wrap_width', '').strip()
+            if pref_wrap_width:
+                 config['wrap_width'] = int(pref_wrap_width)
+        except ValueError:
+             if config['debug_mode']:
+                 print(f"[Debug] Invalid wrap_width value '{prefs.get('wrap_width', '')}', using default {config['wrap_width']}")
+
+        # --- Parse and Validate Temperature ---
+        temp_str = prefs.get('temperature', '').strip()
+        original_temp_value = None
+        try:
+            if temp_str:
+                temp_float = float(temp_str)
+                original_temp_value = temp_float
+                config['temperature'] = max(0.0, min(1.0, temp_float))
+                if original_temp_value != config['temperature']:
+                     print(f"[Info] Gemini Direct: Temperature '{original_temp_value}' is outside the range [0.0, 1.0]. "
+                           f"Using clamped value: {config['temperature']:.2f}")
+        except ValueError:
+            if config['debug_mode']:
+                print(f"[Debug] Invalid temperature value '{temp_str}', using default {config['temperature']:.2f}")
+
+        # --- Parse and Validate Wide Script Factor ---
+        factor_str = prefs.get('wide_script_factor', '').strip()
+        original_factor_value = None
+        try:
+            if factor_str:
+                factor_float = float(factor_str)
+                original_factor_value = factor_float
+                config['wide_script_factor'] = max(0.2, min(1.8, factor_float))
+                if original_factor_value != config['wide_script_factor']:
+                    print(f"[Info] Gemini Direct: Wide Script Factor '{original_factor_value}' outside allowed range [0.2, 1.8]. "
+                          f"Using clamped value: {config['wide_script_factor']:.3f}")
+        except ValueError:
+             if config['debug_mode']:
+                 print(f"[Debug] Invalid Wide Script Factor '{factor_str}', using default {config['wide_script_factor']:.3f}")
+
+        # --- Determine model to use ---
+        config['model_to_use'] = config['custom_model'] if config['custom_model'] else config['model']
+        if not config['model_to_use'].startswith('models/'):
+            config['model_to_use'] = f"models/{config['model_to_use']}"
+        config['model_name'] = config['model_to_use'].split('/')[-1]
+
+        # --- Adjust log settings ---
+        if not config['log_enabled']:
+            config['show_log_line'] = False
+
+        if config['log_path']:
+            config['log_path'] = os.path.expanduser(config['log_path'])
+        elif config['log_enabled']:
+            config['log_path'] = os.path.expanduser("~/Documents/gemini_direct_qa.log")
+        else:
+             config['log_path'] = None
+
+        return config
+
+    def _build_prompt(self, query, context):
+        """Builds the full prompt including system message and context."""
+        if context:
+            full_context = f"{SYSTEM_PROMPT}\n\n{context}"
+            return f"{full_context}\n\n{query}"
+        else:
+            return f"{SYSTEM_PROMPT}\n\n{query}"
+
+    def _call_gemini_api(self, config, query):
+        """Makes the API call to Gemini."""
+        url = f"https://generativelanguage.googleapis.com/v1beta/{config['model_to_use']}:generateContent"
+        headers = {"Content-Type": "application/json"}
+        params = {"key": config['api_key']}
+        prompt = self._build_prompt(query, config['prompt_context'])
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": config['temperature']}
+        }
+
+        if config['debug_mode']:
+            masked_params = {"key": mask_api_key(config['api_key'])}
+            print("\n--- Gemini API Request ---")
+            print(f"[Debug] URL: {url}")
+            print(f"[Debug] Params: {masked_params}")
+            print(f"[Debug] Temp: {config['temperature']:.2f}")
+            print(f"[Debug] User Query: {query}")
+            print("--------------------------")
+
+        response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
+
+        if config['debug_mode']:
+            print("\n--- Gemini API Response ---")
+            print(f"[Debug] Status Code: {response.status_code}")
+            try:
+                response_data = response.json()
+                response_str = json.dumps(response_data, ensure_ascii=False, indent=2)
+                print(f"[Debug] Response Body (JSON):\n{response_str}")
+            except json.JSONDecodeError:
+                print(f"[Debug] Response Body (Raw Text):\n{response.text}")
+            print("---------------------------")
+
+        return response
+
+    def _process_api_response(self, response, config, query, extension):
+        """Processes the API response and returns Ulauncher items."""
+        items = []
+        response_json = None
+
+        try:
+            response_json = response.json()
+        except json.JSONDecodeError:
+            error_msg = f"Invalid JSON response from API. Status: {response.status_code}. Body: {response.text[:200]}..."
+            items.append(ExtensionResultItem(
+                icon='images/error.png',
+                name='API Error: Invalid Response',
+                description=error_msg if config['debug_mode'] else "Received non-JSON response from API.",
+                on_enter=CopyToClipboardAction(f"API Error {response.status_code}: {response.text}")
+            ))
+            return items
+
+        # --- Process successful response (Status Code 200) ---
+        if response.status_code == 200:
+            response_text = ""
+            candidates = response_json.get("candidates", [])
+            if candidates:
+                content = candidates[0].get("content")
+                if content:
+                    parts = content.get("parts")
+                    if parts:
+                         response_text = parts[0].get("text", "")
+
+            if response_text:
+                extension.last_response = response_text
+                log_success = False
+                if config['log_enabled'] and config['log_path']:
+                    log_success = log_qa(config['log_path'], query, response_text, config['model_name'], config['debug_mode'])
+                    if not log_success and config['debug_mode']:
+                         print(f"[Debug] Failed to log Q&A to {config['log_path']}")
+
+                formatted_text = format_for_display(
+                    response_text,
+                    config['wrap_width'],
+                    config['wide_script_factor']
+                )
+                items.append(ExtensionResultItem(
+                    icon='images/gemini.png',
+                    name=formatted_text,
+                    description=f'\nresponse by {config["model_name"]}',
+                    on_enter=CopyToClipboardAction(response_text)
+                ))
+
+                if config['log_enabled'] and config['log_path'] and config['show_log_line'] and log_success:
+                    display_log_path = shorten_path_for_display(config["log_path"])
+                    items.append(ExtensionResultItem(
+                        icon='images/log.png',
+                        name='',
+                        description=f'Q&A saved to {display_log_path}',
+                        on_enter=OpenUrlAction(f'file://{config["log_path"]}')
+                    ))
+            else:
+                description = "API returned an empty response."
+                prompt_feedback = response_json.get("promptFeedback")
+                if prompt_feedback:
+                     block_reason = prompt_feedback.get("blockReason")
+                     if block_reason:
+                         description = f"Blocked: {block_reason}."
+                         if config['debug_mode']:
+                              safety_ratings = prompt_feedback.get("safetyRatings", [])
+                              ratings_str = ", ".join([f"{r.get('category')}: {r.get('probability')}" for r in safety_ratings])
+                              if ratings_str:
+                                   description += f" Safety: [{ratings_str}]"
+                     elif config['debug_mode']:
+                         description += f" (Debug: Prompt feedback present but no block reason: {json.dumps(prompt_feedback)})"
+
+                items.append(ExtensionResultItem(
+                    icon='images/warning.png',
+                    name='Empty response from Gemini',
+                    description=description,
+                    on_enter=CopyToClipboardAction(f"Empty response from Gemini. Reason: {description}. Full JSON: {json.dumps(response_json)}")
+                ))
+
+        elif response.status_code == 429:
+            error_msg = "Rate limit exceeded. Free tier limit often 15 reqs/min. Wait and try again."
+            items.append(ExtensionResultItem(
+                icon='images/warning.png',
+                name='Rate limit exceeded (429)',
+                description=error_msg,
+                on_enter=CopyToClipboardAction(error_msg)
+            ))
+        else:
+            status_code = response.status_code
+            error_msg = "Unknown API error"
+            is_likely_api_key_error = False
+
+            if response_json and "error" in response_json:
+                error_details = response_json["error"]
+                error_msg = error_details.get("message", "No error message provided.")
+
+                api_key_error_keywords = ["api key not valid", "permission denied", "api key invalid"]
+                if status_code == 403 or any(keyword in error_msg.lower() for keyword in api_key_error_keywords):
+                     is_likely_api_key_error = True
+                     error_msg = f"API Key Error: {error_msg}"
+
+                if config['debug_mode'] and not is_likely_api_key_error:
+                    error_msg += f" (Status: {error_details.get('status', 'N/A')}, Code: {error_details.get('code', 'N/A')})"
+
+            if is_likely_api_key_error:
+                items.append(ExtensionResultItem(
+                    icon='images/warning.png',
+                    name='Invalid API Key?',
+                    description=error_msg,
+                    on_enter=OpenUrlAction('ulauncher://extensions/ul-query-gemini/preferences')
+                ))
+            else:
+                items.append(ExtensionResultItem(
+                    icon='images/error.png',
+                    name=f'API Error {status_code}',
+                    description=error_msg,
+                    on_enter=CopyToClipboardAction(f"Error {status_code}: {error_msg}\nResponse: {json.dumps(response_json)}")
+                ))
+
+        return items
+
+    # --- Main event handler ---
     def on_event(self, event, extension):
         query = event.get_argument() or ""
         items = []
 
         try:
-            config = load_preferences(extension)
+            config = self._load_preferences(extension)
         except Exception as e:
             print(f"[Error] Failed to load preferences: {e}")
             print(traceback.format_exc())
@@ -450,13 +450,16 @@ class KeywordQueryEventListener(EventListener):
             ))
             return RenderResultListAction(items)
 
+        debug_mode = config['debug_mode']
+        trigger_char = config['trigger_char']
+
         # --- Handle empty query ---
         if not query:
             items.append(ExtensionResultItem(
                 icon='images/icon.png',
                 name=f'Ask Gemini ({config["model_name"]})',
-                description='Type your question and press Enter to get an answer',
-                on_enter=CopyToClipboardAction(f'Gemini Direct ({config["model_name"]}) ready.')
+                description=f'Type your question and end with "{trigger_char}" to send',
+                on_enter=DoNothingAction()
             ))
             return RenderResultListAction(items)
 
@@ -470,40 +473,25 @@ class KeywordQueryEventListener(EventListener):
             ))
             return RenderResultListAction(items)
 
-        # --- Show "Press Enter to query" prompt ---
-        items.append(ExtensionResultItem(
-            icon='images/icon.png',
-            name=query,
-            description=f'Press Enter to ask Gemini ({config["model_name"]})',
-            on_enter=ExtensionCustomAction({'action': 'query_gemini', 'query': query})
-        ))
+        # --- Check if query ends with trigger character ---
+        should_query = query.endswith(trigger_char)
         
-        return RenderResultListAction(items)
-
-
-class ItemEnterEventListener(EventListener):
-    def on_event(self, event, extension):
-        data = event.get_data()
-        
-        if data.get('action') == 'query_gemini':
-            query = data.get('query')
-            items = []
+        if should_query:
+            # Remove trigger character from query
+            clean_query = query[:-len(trigger_char)].strip()
             
+            # Check if we already have a response for this query
+            if clean_query == extension.last_query and extension.last_response_items:
+                return RenderResultListAction(extension.last_response_items)
+            
+            # Store the query
+            extension.last_query = clean_query
+            
+            # Execute API call
             try:
-                config = load_preferences(extension)
-                debug_mode = config['debug_mode']
-                
-                # Show "Querying..." feedback
-                items.append(ExtensionResultItem(
-                    icon='images/icon.png',
-                    name='Querying Gemini...',
-                    description=f'Please wait while {config["model_name"]} processes your request',
-                    on_enter=CopyToClipboardAction('')
-                ))
-                
-                # Execute API call
-                response = call_gemini_api(config, query)
-                items = process_api_response(response, config, query, extension)
+                response = self._call_gemini_api(config, clean_query)
+                items = self._process_api_response(response, config, clean_query, extension)
+                extension.last_response_items = items
 
             except requests.exceptions.Timeout:
                 error_message = 'Connection timed out. Check network or API status.'
@@ -513,8 +501,7 @@ class ItemEnterEventListener(EventListener):
                     description=error_message,
                     on_enter=CopyToClipboardAction(error_message)
                 ))
-                if debug_mode:
-                    print("[Debug] Request timed out.")
+                if debug_mode: print("[Debug] Request timed out.")
 
             except requests.exceptions.RequestException as e:
                 error_message = f'Network Error: {e}'
@@ -535,11 +522,18 @@ class ItemEnterEventListener(EventListener):
                     description=str(e) if debug_mode else 'An internal error occurred.',
                     on_enter=CopyToClipboardAction(error_message + (f"\n{traceback.format_exc()}" if debug_mode else ""))
                 ))
-                print(f"[Error] Unexpected error processing query '{query}': {e}")
+                print(f"[Error] Unexpected error processing query '{clean_query}': {e}")
                 print(traceback.format_exc())
+        else:
+            # Show prompt to add trigger character
+            items.append(ExtensionResultItem(
+                icon='images/icon.png',
+                name=query,
+                description=f'Add "{trigger_char}" at the end to send to Gemini ({config["model_name"]})',
+                on_enter=DoNothingAction()
+            ))
 
-            return RenderResultListAction(items)
-
+        return RenderResultListAction(items)
 
 if __name__ == '__main__':
     GeminiExtension().run()
